@@ -3,12 +3,11 @@
 #include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <sys/time.h>
 #include <sys/types.h>
-#include <stdint.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <stdint.h>
 
 #ifndef LOOPS
 #define LOOPS 100000
@@ -24,6 +23,11 @@
 
 #ifndef CHILD_CPU
 #define CHILD_CPU 0
+#endif
+
+// In the ideal ping-pong, each round-trip has exactly two context switches.
+#ifndef CS_PER_RTRIP
+#define CS_PER_RTRIP 2
 #endif
 
 static void die(const char *msg) { perror(msg); exit(EXIT_FAILURE); }
@@ -60,6 +64,13 @@ int main(void) {
         close(p2c[1]); close(c2p[0]);
 
         int hey;
+        // warm-up a few exchanges to stabilize scheduling/caches
+        for (int i = 0; i < 1024; i++) {
+            if (read(p2c[0], &hey, sizeof(hey)) != sizeof(hey)) die("child warmup read");
+            hey++;
+            if (write(c2p[1], &hey, sizeof(hey)) != sizeof(hey)) die("child warmup write");
+        }
+
         for (int i = 0; i < LOOPS; i++) {
             if (read(p2c[0], &hey, sizeof(hey)) != sizeof(hey)) die("child read");
             hey++;
@@ -72,6 +83,13 @@ int main(void) {
         close(p2c[0]); close(c2p[1]);
 
         int hey = 0;
+
+        // warm-up
+        for (int i = 0; i < 1024; i++) {
+            if (write(p2c[1], &hey, sizeof(hey)) != sizeof(hey)) die("parent warmup write");
+            if (read(c2p[0], &hey, sizeof(hey)) != sizeof(hey)) die("parent warmup read");
+        }
+
         uint64_t t0 = ns_now();
 
         for (int i = 0; i < LOOPS; i++) {
@@ -83,13 +101,20 @@ int main(void) {
         wait(NULL);
 
         double total_ns = (double)(t1 - t0);
+        double ns_per_rtrip = total_ns / LOOPS;
+        double ns_per_cs = ns_per_rtrip / CS_PER_RTRIP;
+
         printf("# %d pipe round-trips (parent->child->parent)\n", LOOPS);
-        if (USE_AFFINITY)
-            printf("# Affinity: parent->CPU%d, child->CPU%d\n", PARENT_CPU, CHILD_CPU);
-        else
-            printf("# No Affinity\n");
-        printf("  Total time : %.3f sec\n", total_ns / 1e9);
-        printf("  ns per rtrip: %.2f\n", total_ns / LOOPS);
-        printf("  rtrips/sec : %.0f\n", 1e9 / (total_ns / LOOPS));
+#if USE_AFFINITY
+        printf("# Affinity: parent->CPU%d, child->CPU%d\n", PARENT_CPU, CHILD_CPU);
+#else
+        printf("# No Affinity\n");
+#endif
+        printf("# Assumed %d context switches per round-trip\n", CS_PER_RTRIP);
+        printf("total time: %.6f (s)\n", total_ns / 1e9);
+        printf("per round-trip: %.2f (ns)\n", ns_per_rtrip);
+        printf("per context switch (approx): %.2f (ns)\n", ns_per_cs);
+        printf("round-trips per second: %.0f\n", 1e9 / ns_per_rtrip);
     }
+    return 0;
 }
